@@ -1,0 +1,143 @@
+name: Train and Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'src/training/**'
+      - 'data/**'
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: 'Number of training epochs'
+        default: '15'
+      latent_dim:
+        description: 'Latent dimension size'
+        default: '32'
+
+env:
+  AWS_REGION: us-west-2
+  ECR_REPOSITORY: anomaly-detector-api
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  train:
+    name: Train Model
+    runs-on: ubuntu-latest
+    outputs:
+      run_id: ${{ steps.train.outputs.run_id }}
+      auroc: ${{ steps.train.outputs.auroc }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Train model
+        id: train
+        run: |
+          python -m src.training.train \
+            --epochs ${{ github.event.inputs.epochs || '15' }} \
+            --latent-dim ${{ github.event.inputs.latent_dim || '32' }} \
+            2>&1 | tee train.log
+
+          # Parse MLflow run ID and metrics from log
+          RUN_ID=$(python -c "
+          import mlflow
+          runs = mlflow.search_runs(experiment_names=['anomaly-detection'], order_by=['start_time DESC'], max_results=1)
+          print(runs.iloc[0]['run_id'])
+          ")
+          AUROC=$(python -c "
+          import mlflow
+          runs = mlflow.search_runs(experiment_names=['anomaly-detection'], order_by=['start_time DESC'], max_results=1)
+          print(runs.iloc[0]['metrics.auroc'])
+          ")
+          echo "run_id=$RUN_ID" >> $GITHUB_OUTPUT
+          echo "auroc=$AUROC" >> $GITHUB_OUTPUT
+
+      - name: Gate on AUROC threshold
+        run: |
+          python -c "
+          auroc = float('${{ steps.train.outputs.auroc }}')
+          assert auroc >= 0.90, f'AUROC {auroc:.3f} below threshold 0.90 — blocking deploy'
+          print(f'AUROC {auroc:.3f} passed threshold check')
+          "
+
+      - name: Upload MLflow artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mlflow-artifacts
+          path: |
+            mlflow.db
+            mlruns/
+
+  build-and-push:
+    name: Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: train
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download MLflow artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: mlflow-artifacts
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push image
+        run: |
+          ECR_REGISTRY=${{ steps.login-ecr.outputs.registry }}
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+                     $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: production
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy new image on EC2
+        run: |
+          aws ssm send-command \
+            --targets "Key=tag:Project,Values=anomaly-detector" \
+            --document-name "AWS-RunShellScript" \
+            --parameters commands=[
+              "aws ecr get-login-password --region ${{ env.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}",
+              "docker pull ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest",
+              "docker stop anomaly-api || true",
+              "docker rm anomaly-api || true",
+              "docker run -d --restart unless-stopped -p 8000:8000 --name anomaly-api ${{ secrets.ECR_REGISTRY }}/${{ env.ECR_REPOSITORY }}:latest"
+            ]
+
+      - name: Smoke test
+        run: |
+          sleep 30
+          curl -f http://${{ secrets.EC2_PUBLIC_IP }}:8000/health
